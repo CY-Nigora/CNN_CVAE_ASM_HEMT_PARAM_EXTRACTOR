@@ -86,7 +86,7 @@ class TrainConfig:
     prior_bound_margin: float = 0.05
 
     enforce_bounds: bool = True
-    es_metric: str = 'val_total_post' # Changed to a reliable metric present in eval dict
+    es_metric: str = 'val_cyc_meas'
     es_min_delta: float = 5e-6
 
     # proxy / cyc
@@ -497,45 +497,89 @@ def infer_cli(args, device):
     # (Optional) CSV saving logic here...
 
 def parse_args():
-    p = argparse.ArgumentParser(description='ASM-HEMT Dual CVAE')
-    p.add_argument('--data', type=str, help='Training H5')
+    p = argparse.ArgumentParser(description='ASM-HEMT CVAE Training and Inference (Dual Input)')
+    p.add_argument('--data', type=str, help='Training H5 with X_iv, X_gm, Y.')
     p.add_argument('--outdir', type=str, default='runs_dual')
     p.add_argument('--seed', type=int, default=42)
-    
-    # Training Params
-    p.add_argument('--max-epochs', type=int, default=300)
-    p.add_argument('--batch-size', type=int, default=512)
-    p.add_argument('--lr', type=float, default=1.55e-4)
     p.add_argument('--test-split', type=float, default=0.15)
     p.add_argument('--val-split', type=float, default=0.15)
-    
-    # Model Params
-    p.add_argument('--hidden', type=str, default='960,512,256')
-    p.add_argument('--latent-dim', type=int, default=32)
-    
-    # Proxy / Cycle
+    p.add_argument('--max-epochs', type=int, default=300)
+    p.add_argument('--onecycle-epochs', type=int, default=0)
+    p.add_argument('--batch-size', type=int, default=512)
+    p.add_argument('--lr', type=float, default=1.55e-4)
+    p.add_argument('--weight-decay', type=float, default=2e-4)
+    p.add_argument('--patience', type=int, default=40)
+    p.add_argument('--num-workers', type=int, default=0)
+    p.add_argument('--compile', action='store_true')
+    p.add_argument('--no-onecycle', action='store_true')
+
+    p.add_argument('--aug-noise-std', type=float, default=0.015)
+    p.add_argument('--aug-prob', type=float, default=0.5)
+    p.add_argument('--aug-gain-std', type=float, default=0.0)
+    p.add_argument('--aug-schedule', type=str, default='none', choices=["none","linear_decay","cosine"])
+    p.add_argument('--aug-final-scale', type=float, default=0.5)
+
+    p.add_argument('--meas-h5', type=str)
+    p.add_argument('--lambda-cyc-sim', type=float, default=1.2)
+    p.add_argument('--lambda-cyc-meas', type=float, default=0.8)
+    p.add_argument('--cyc-warmup-epochs', type=int, default=110)
+
     p.add_argument('--proxy-run', type=str)
     p.add_argument('--auto-train-proxy', action='store_true')
     p.add_argument('--train-proxy-only', action='store_true')
-    p.add_argument('--lambda-cyc-sim', type=float, default=1.2)
-    p.add_argument('--lambda-cyc-meas', type=float, default=0.8)
-    p.add_argument('--meas-h5', type=str)
+    p.add_argument('--proxy-hidden', type=str, default='512,512,512,512')
+    p.add_argument('--proxy-epochs', type=int, default=200)
+    p.add_argument('--proxy-lr', type=float, default=2e-4)
+    p.add_argument('--proxy-wd', type=float, default=5e-5)
+    p.add_argument('--proxy-beta', type=float, default=0.02)
+    p.add_argument('--proxy-patience', type=int, default=25)
+    p.add_argument('--proxy-min-delta', type=float, default=5e-6)
+    p.add_argument('--proxy-batch-size', type=int, default=2048)
+    p.add_argument('--proxy-seed', type=int, default=None)
 
-    # Regulations
+    p.add_argument('--hidden', type=str, default='960,512,256')
+    p.add_argument('--latent-dim', type=int, default=32)
+    p.add_argument('--feat-dim', type=int, default=256)
+    p.add_argument('--cnn-dropout', type=float, default=0.0)
+    p.add_argument('--dropout', type=float, default=0.0)
+    p.add_argument('--kl-beta', type=float, default=0.1)
+    p.add_argument('--sup-weight', type=float, default=0.9)
+
     p.add_argument('--prior-l2', type=float, default=1e-2)
     p.add_argument('--prior-bound', type=float, default=3e-3)
+    p.add_argument('--prior-bound-margin', type=float, default=0.05)
+    p.add_argument('--no-bounds', action='store_true')
+    p.add_argument('--es-metric', type=str, default='val_cyc_meas')
+    p.add_argument('--es-min-delta', type=float, default=5e-6)
+
     p.add_argument('--trust-alpha', type=float, default=0.18)
-    
-    # Infer
+    p.add_argument('--trust-tau', type=float, default=1.6)
+    p.add_argument('--trust-ref-max', type=int, default=20000)
+    p.add_argument('--trust-ref-batch', type=int, default=4096)
+    p.add_argument('--trust-alpha-meas', type=float, default=0.08)
+    p.add_argument('--cyc-meas-knn-weight', action='store_true')
+    p.add_argument('--cyc-meas-knn-gamma', type=float, default=0.5)
+
+    p.add_argument('--diag', action='store_true')
+    p.add_argument('--diag-max-samples', type=int, default=256)
+    p.add_argument('--diag-knn-k', type=int, default=8)
+
+    p.add_argument('--best-of-k', type=int, default=0)
+    p.add_argument('--bok-warmup-epochs', type=int, default=0)
+    p.add_argument('--bok-target', choices=['sim','meas','both','none'], default='sim')
+    p.add_argument('--bok-apply', type=str, default='train')
+
     p.add_argument('--infer-run', type=str)
-    p.add_argument('--input-npy', type=str)
-    p.add_argument('--input-h5', type=str)
+    p.add_argument('--input-npy', type=str, help='Dual infer .npz with X_iv/X_gm')
+    p.add_argument('--input-h5', type=str, help='Dual infer H5 with X_iv/X_gm')
     p.add_argument('--index', type=int)
     p.add_argument('--num-samples', type=int, default=10)
-    p.add_argument('--sample-mode', type=str, default='rand')
-
-    # BoK (Minimal args for compat)
-    p.add_argument('--best-of-k', type=int, default=0)
+    p.add_argument('--sample-mode', type=str, default='rand', choices=['rand','mean'])
+    p.add_argument('--z-sample-mode', type=str, default='rand', choices=['rand','mean'])
+    p.add_argument('--save-csv', type=str)
+    p.add_argument('--dropout-val', action='store_true')
+    p.add_argument('--dropout-test', action='store_true')
+    p.add_argument('--dropout-infer', action='store_true')
     
     # Defaults for other fields in TrainConfig (simplified parsing)
     args = p.parse_args()
@@ -543,17 +587,39 @@ def parse_args():
     # Construct Config
     cfg = TrainConfig(
         data=args.data, outdir=args.outdir, seed=args.seed,
-        max_epochs=args.max_epochs, batch_size=args.batch_size, lr=args.lr,
-        hidden=tuple(map(int, args.hidden.split(','))), latent_dim=args.latent_dim,
+        test_split=args.test_split, val_split=args.val_split,
+        max_epochs=args.max_epochs, onecycle_epochs=args.onecycle_epochs,
+        batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
+        patience=args.patience, num_workers=args.num_workers,
+        compile=args.compile, use_onecycle=(not args.no_onecycle),
+        aug_noise_std=args.aug_noise_std, aug_prob=args.aug_prob,
+        aug_gain_std=args.aug_gain_std, aug_schedule=args.aug_schedule, aug_final_scale=args.aug_final_scale,
+        meas_h5=args.meas_h5, lambda_cyc_sim=args.lambda_cyc_sim, lambda_cyc_meas=args.lambda_cyc_meas,
+        cyc_warmup_epochs=args.cyc_warmup_epochs,
         proxy_run=args.proxy_run, auto_train_proxy=args.auto_train_proxy,
         train_proxy_only=args.train_proxy_only,
-        lambda_cyc_sim=args.lambda_cyc_sim, lambda_cyc_meas=args.lambda_cyc_meas,
-        meas_h5=args.meas_h5, prior_l2=args.prior_l2, prior_bound=args.prior_bound,
-        trust_alpha=args.trust_alpha,
-        best_of_k=args.best_of_k,
-        test_split=args.test_split, val_split=args.val_split
+        proxy_hidden=tuple(map(int, args.proxy_hidden.split(','))),
+        proxy_epochs=args.proxy_epochs, proxy_lr=args.proxy_lr, proxy_wd=args.proxy_wd,
+        proxy_beta=args.proxy_beta, proxy_patience=args.proxy_patience, proxy_min_delta=args.proxy_min_delta,
+        proxy_batch_size=args.proxy_batch_size, proxy_seed=args.proxy_seed,
+        hidden=tuple(map(int, args.hidden.split(','))),
+        latent_dim=args.latent_dim, feat_dim=args.feat_dim, cnn_dropout=args.cnn_dropout,
+        dropout=args.dropout, kl_beta=args.kl_beta, sup_weight=args.sup_weight,
+        prior_l2=args.prior_l2, prior_bound=args.prior_bound, prior_bound_margin=args.prior_bound_margin,
+        enforce_bounds=(not args.no_bounds),
+        es_metric=args.es_metric, es_min_delta=args.es_min_delta,
+        trust_alpha=args.trust_alpha, trust_tau=args.trust_tau,
+        trust_ref_max=args.trust_ref_max, trust_ref_batch=args.trust_ref_batch,
+        trust_alpha_meas=args.trust_alpha_meas,
+        cyc_meas_knn_weight=args.cyc_meas_knn_weight, cyc_meas_knn_gamma=args.cyc_meas_knn_gamma,
+        best_of_k=args.best_of_k, bok_warmup_epochs=args.bok_warmup_epochs,
+        bok_target=args.bok_target, bok_apply=args.bok_apply,
+        num_samples=args.num_samples, sample_mode=args.sample_mode,
+        z_sample_mode=args.z_sample_mode,
+        dropout_val=args.dropout_val, dropout_test=args.dropout_test, dropout_infer=args.dropout_infer
     )
-    return cfg, args, {}
+    diag_cfg = {'enable': args.diag, 'max_samples': args.diag_max_samples, 'knn_k': args.diag_knn_k}
+    return cfg, args, diag_cfg
 
 def main():
     cfg, args, diag_cfg = parse_args()
