@@ -1,0 +1,470 @@
+# regulations.py
+import math
+from typing import Optional, List, Dict, Tuple, Literal
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ==========
+# Safe ops (same as your original)
+# ==========
+def _sanitize(t: torch.Tensor, clip: float|None = 1e6) -> torch.Tensor:
+    t = torch.nan_to_num(t, nan=0.0, posinf=1e38, neginf=-1e38)
+    if clip is not None:
+        t = torch.clamp(t, min=-clip, max=clip)
+    return t
+
+def _safe_cdist(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    a = _sanitize(a); b = _sanitize(b)
+    a2 = (a * a).sum(dim=1, keepdim=True)
+    b2 = (b * b).sum(dim=1, keepdim=True).T
+    dist2 = a2 + b2 - 2.0 * (a @ b.T)
+    return dist2.clamp_min(eps).sqrt()
+
+def softplus0(t: torch.Tensor, beta: float = 2.0) -> torch.Tensor:
+    return torch.clamp_min(F.softplus(t, beta=beta) - (math.log(2.0)/beta), 0.0)
+
+# ==========
+# Priors / boundary (unchanged)
+# ==========
+def NormCalc_prior_bnd(device, y_tf, y_hat_32, PARAM_RANGE,
+                       prior_bound, prior_bound_margin,
+                       per_sample_ena: bool = False):
+    if prior_bound <= 0.0:
+        return torch.zeros((), device=device) if not per_sample_ena else torch.zeros(y_hat_32.size(0), device=device)
+
+    y_phys = y_tf.inverse(y_hat_32.to(torch.float32))
+    names, dev = y_tf.names, device
+    lo = torch.tensor([PARAM_RANGE[n][0] for n in names], device=dev, dtype=torch.float32)
+    hi = torch.tensor([PARAM_RANGE[n][1] for n in names], device=dev, dtype=torch.float32)
+    width = (hi - lo).clamp_min(1e-12)
+    log_mask = y_tf.log_mask.to(dev)
+
+    if per_sample_ena:
+        B = y_hat_32.size(0)
+        bound_lin = torch.zeros(B, device=dev)
+        bound_log = torch.zeros(B, device=dev)
+    else:
+        bound_lin = torch.zeros((), device=dev)
+        bound_log = torch.zeros((), device=dev)
+
+    if (~log_mask).any():
+        y_lin = y_phys[:, ~log_mask]
+        lo_lin, hi_lin, w_lin = lo[~log_mask], hi[~log_mask], width[~log_mask]
+        over_hi = softplus0((y_lin - (hi_lin + prior_bound_margin * w_lin)) / w_lin, beta=2.0)
+        over_lo = softplus0(((lo_lin - prior_bound_margin * w_lin) - y_lin) / w_lin, beta=2.0)
+        term = (over_hi + over_lo).mean(dim=1)
+        bound_lin = term if per_sample_ena else term.mean()
+
+    if log_mask.any():
+        y_log = torch.log10(y_phys[:, log_mask].clamp_min(1e-21)) # FIX: 1e-12 -> 1e-21
+        lo_log = torch.log10(lo[log_mask].clamp_min(1e-21))       # FIX: 1e-12 -> 1e-21
+        hi_log = torch.log10(hi[log_mask].clamp_min(1e-21))       # FIX: 1e-12 -> 1e-21
+        w_log  = (hi_log - lo_log).clamp_min(1e-6)
+        over_hi = softplus0((y_log - (hi_log + prior_bound_margin * w_log)) / w_log, beta=2.0)
+        over_lo = softplus0(((lo_log - prior_bound_margin * w_log) - y_log) / w_log, beta=2.0)
+        term = (over_hi + over_lo).mean(dim=1)
+        bound_log = term if per_sample_ena else term.mean()
+
+    return bound_lin + bound_log
+
+# ==========
+# Cycle consistency (x is now X_concat flatten std)
+# ==========
+def NormCalc_cyc(device, proxy_g, lambda_cyc, y_tf, y_tf_proxy, y_hat_32,
+                 x_flat_std, x_mu_c, x_std_c, x_mu_p, x_std_p,
+                 y_idx_c_from_p, cyc_crit):
+    y_hat_32 = _sanitize(y_hat_32)
+    x_flat_std = _sanitize(x_flat_std)
+
+    cyc = torch.tensor(0.0, device=device)
+    xhat_curr_std = x_flat_std
+    if (proxy_g is not None and lambda_cyc > 0.0):
+        y_phys = _sanitize(y_tf.inverse(y_hat_32), clip=None)
+        if y_idx_c_from_p is not None:
+            y_phys = y_phys.index_select(1, y_idx_c_from_p)
+
+        y_proxy_norm = _sanitize(y_tf_proxy.transform(y_phys))
+        xhat_proxy_std = _sanitize(proxy_g(y_proxy_norm))
+        xhat_phys = _sanitize(xhat_proxy_std * x_std_p + x_mu_p)
+        xhat_curr_std = _sanitize((xhat_phys - x_mu_c) / x_std_c)
+
+        cyc = cyc_crit(xhat_curr_std, x_flat_std)
+    return cyc, xhat_curr_std
+
+def NormCalc_cyc_dual(
+    device, 
+    proxy_iv, proxy_gm, L_iv: int, # Split point
+    y_tf, y_tf_proxy, y_hat_32,
+    x_flat_std, # [B, L_iv + L_gm] (Target)
+    x_mu_c, x_std_c, x_mu_p, x_std_p, # Global stats
+    y_idx_c_from_p, cyc_crit,
+    weight_iv: float = 1.0, weight_gm: float = 1.0
+):
+    y_hat_32 = _sanitize(y_hat_32)
+    x_flat_std = _sanitize(x_flat_std)
+
+    # 1. Split Target
+    target_iv = x_flat_std[:, :L_iv]
+    target_gm = x_flat_std[:, L_iv:]
+
+    # 2. Prepare Proxy Input
+    y_phys = _sanitize(y_tf.inverse(y_hat_32), clip=None)
+    if y_idx_c_from_p is not None:
+        y_phys = y_phys.index_select(1, y_idx_c_from_p)
+    
+    y_proxy_norm = _sanitize(y_tf_proxy.transform(y_phys))
+
+    # 3. Dual Inference
+    # Note: Proxies predict in their own training distribution (x_std_p)
+    pred_iv_p = _sanitize(proxy_iv(y_proxy_norm))
+    pred_gm_p = _sanitize(proxy_gm(y_proxy_norm))
+
+    # 4. Domain Adaptation (Proxy Space -> Physical -> Current CVAE Space)
+    # Split the global stats vectors
+    mu_p_iv, mu_p_gm = x_mu_p[:L_iv], x_mu_p[L_iv:]
+    std_p_iv, std_p_gm = x_std_p[:L_iv], x_std_p[L_iv:]
+    mu_c_iv, mu_c_gm = x_mu_c[:L_iv], x_mu_c[L_iv:]
+    std_c_iv, std_c_gm = x_std_c[:L_iv], x_std_c[L_iv:]
+
+    # IV Path
+    pred_iv_phys = pred_iv_p * std_p_iv + mu_p_iv
+    pred_iv_curr = _sanitize((pred_iv_phys - mu_c_iv) / std_c_iv)
+
+    # GM Path
+    pred_gm_phys = pred_gm_p * std_p_gm + mu_p_gm
+    pred_gm_curr = _sanitize((pred_gm_phys - mu_c_gm) / std_c_gm)
+
+    # 5. Calculate Split Losses
+    loss_iv = cyc_crit(pred_iv_curr, target_iv) * weight_iv
+    loss_gm = cyc_crit(pred_gm_curr, target_gm) * weight_gm
+
+    # Reconstruct full vector for potential concat usage
+    xhat_curr_std = torch.cat([pred_iv_curr, pred_gm_curr], dim=1)
+
+    return loss_iv, loss_gm, xhat_curr_std
+
+def _smooth_l1_per_sample(diff: torch.Tensor, beta: float = 0.02) -> torch.Tensor:
+    absd = diff.abs()
+    return torch.where(absd < beta, 0.5*(diff**2)/beta, absd - 0.5*beta).mean(dim=1)
+
+# ==========
+# Best-of-K selection in prior path
+# Here x_feat is CNN feature vector h (not raw x)
+# ==========
+def bok_prior_select_and_cyc(
+    model, device, K: int,
+    x_feat,                  # [B, H]
+    x_flat_std,              # [B, Xd_concat] for cycle compare
+    mu_prior, logvar_prior,  # [B, L]
+    y_tf, y_tf_proxy, proxy_g,
+    x_mu_c, x_std_c, x_mu_p, x_std_p,
+    y_idx_c_from_p,
+    cyc_crit,
+):
+    B, L = mu_prior.shape
+    muK = mu_prior.unsqueeze(1).expand(B, K, L)
+    lvK = logvar_prior.unsqueeze(1).expand(B, K, L)
+    eps = torch.randn_like(muK)
+    zK  = muK + eps * torch.exp(0.5 * lvK)     # [B,K,L]
+    xK  = x_feat.unsqueeze(1).expand(B, K, x_feat.shape[-1])  # [B,K,H]
+
+    in_dec = torch.cat([xK.reshape(B*K, -1), zK.reshape(B*K, -1)], dim=1)
+    yK = model.decoder(in_dec)
+    yK32 = _sanitize(yK.to(torch.float32))
+
+    y_physK = _sanitize(y_tf.inverse(yK32))
+    if y_idx_c_from_p is not None:
+        y_physK = y_physK.index_select(1, y_idx_c_from_p)
+    y_proxy_normK   = _sanitize(y_tf_proxy.transform(y_physK))
+    xhat_proxy_stdK = _sanitize(proxy_g(y_proxy_normK))
+    xhat_physK      = _sanitize(xhat_proxy_stdK * x_std_p + x_mu_p)
+    xhat_curr_stdK  = _sanitize((xhat_physK - x_mu_c) / x_std_c)
+
+    x_ref = _sanitize(x_flat_std.unsqueeze(1).expand(B, K, x_flat_std.shape[-1]).reshape(B*K, -1))
+    valid = torch.isfinite(xhat_curr_stdK).all(dim=1) & torch.isfinite(x_ref).all(dim=1)
+    diff = xhat_curr_stdK - x_ref
+    ps = _smooth_l1_per_sample(diff, beta=0.02)
+    ps = torch.where(valid, ps, torch.full_like(ps, 1e9))
+
+    cyc_mat = ps.view(B, K)
+    best_idx = torch.argmin(cyc_mat, dim=1)
+    Dy = yK32.shape[-1]
+
+    y_best32 = yK32.view(B, K, Dy).gather(1, best_idx.view(B,1,1).expand(-1,1,Dy)).squeeze(1)
+
+    cyc_sim, x_hat_std_sim_prior = NormCalc_cyc(
+        device, proxy_g, torch.tensor(1.0, device=device),
+        y_tf, y_tf_proxy, y_best32,
+        x_flat_std, x_mu_c, x_std_c, x_mu_p, x_std_p,
+        y_idx_c_from_p, cyc_crit
+    )
+    return y_best32, cyc_sim, x_hat_std_sim_prior
+
+def bok_prior_select_and_cyc_meas(
+    model, device, K: int,
+    x_feat_m,                # [B,H]
+    x_flat_std_m,            # [B,Xd_concat]
+    y_tf, y_tf_proxy, proxy_g,
+    x_mu_c, x_std_c, x_mu_p, x_std_p,
+    y_idx_c_from_p,
+    cyc_meas_knn_weight: bool = False, cyc_meas_knn_gamma: float = 0.5,
+    yref_proxy_norm: Optional[torch.Tensor] = None, trust_tau: float = 1.6,
+):
+    B = x_feat_m.size(0)
+    x_featK = x_feat_m.unsqueeze(1).expand(B, K, x_feat_m.shape[-1]).reshape(B*K, -1)
+    mu_lv = model.prior_net(x_featK)
+    muK, lvK = mu_lv.chunk(2, dim=-1)
+    muK = muK.view(B, K, -1)
+    lvK = lvK.view(B, K, -1)
+    eps = torch.randn_like(muK)
+    zK  = muK + eps * torch.exp(0.5 * lvK)
+
+    xK = x_feat_m.unsqueeze(1).expand(B, K, x_feat_m.shape[-1])
+    in_dec = torch.cat([xK.reshape(B*K, -1), zK.reshape(B*K, -1)], dim=1)
+    yK = model.decoder(in_dec)
+    yK32 = _sanitize(yK.to(torch.float32))
+
+    y_physK = _sanitize(y_tf.inverse(yK32), clip=None)
+    if y_idx_c_from_p is not None:
+        y_physK = y_physK.index_select(1, y_idx_c_from_p)
+    y_proxy_normK   = _sanitize(y_tf_proxy.transform(y_physK))
+    xhat_proxy_stdK = _sanitize(proxy_g(y_proxy_normK))
+    xhat_physK      = _sanitize(xhat_proxy_stdK * x_std_p + x_mu_p)
+    xhat_curr_stdK  = _sanitize((xhat_physK - x_mu_c) / x_std_c)
+
+    x_ref = _sanitize(x_flat_std_m.unsqueeze(1).expand(B, K, x_flat_std_m.shape[-1]).reshape(B*K, -1))
+    validK = torch.isfinite(xhat_curr_stdK).all(dim=1) & torch.isfinite(x_ref).all(dim=1)
+    diffK  = xhat_curr_stdK - x_ref
+    psK    = _smooth_l1_per_sample(diffK, beta=0.02)
+    psK    = torch.where(validK, psK, torch.full_like(psK, 1e9))
+
+    ps_mat   = psK.view(B, K)
+    best_idx = torch.argmin(ps_mat, dim=1)
+    Dy = yK32.shape[-1]; Xd = x_flat_std_m.shape[-1]; Dp = y_proxy_normK.shape[-1]
+
+    gather_y   = best_idx.view(B,1,1).expand(-1,1,Dy)
+    gather_x   = best_idx.view(B,1,1).expand(-1,1,Xd)
+    gather_dpn = best_idx.view(B,1,1).expand(-1,1,Dp)
+
+    ym_best32          = yK32.view(B, K, Dy).gather(1, gather_y).squeeze(1)
+    xmh_curr_std_best  = xhat_curr_stdK.view(B, K, Xd).gather(1, gather_x).squeeze(1)
+    y_proxy_norm_best  = y_proxy_normK.view(B, K, Dp).gather(1, gather_dpn).squeeze(1)
+
+    valid_best = torch.isfinite(xmh_curr_std_best).all(dim=1) & torch.isfinite(x_flat_std_m).all(dim=1)
+    if valid_best.any():
+        diff_best = (xmh_curr_std_best[valid_best] - x_flat_std_m[valid_best]).reshape(valid_best.sum(), -1)
+        absd = diff_best.abs()
+        beta = 0.02
+        cyc_ps = torch.where(absd < beta, 0.5*(diff_best**2)/beta, absd - 0.5*beta).mean(dim=1)
+
+        dmin_best = None
+        if ((cyc_meas_knn_weight or yref_proxy_norm is not None) and (yref_proxy_norm is not None)):
+            Nref = yref_proxy_norm.shape[0]
+            nsub = min(Nref, 4096)
+            idx  = torch.randint(0, Nref, (nsub,), device=yref_proxy_norm.device)
+            yref_sub = yref_proxy_norm.index_select(0, idx)
+            dists_m  = _safe_cdist(y_proxy_norm_best[valid_best], yref_sub)
+            dmin_best= dists_m.min(dim=1).values
+
+        if cyc_meas_knn_weight and (dmin_best is not None):
+            w_knn = torch.clamp(dmin_best / max(1e-6, trust_tau), min=0.0, max=4.0).pow(cyc_meas_knn_gamma).detach()
+            cyc_meas_scalar = (w_knn * cyc_ps).mean()
+        else:
+            cyc_meas_scalar = cyc_ps.mean()
+    else:
+        cyc_meas_scalar = x_flat_std_m.new_tensor(0.0)
+        dmin_best = None
+
+    return ym_best32, cyc_meas_scalar, xmh_curr_std_best, y_proxy_norm_best, valid_best, dmin_best
+
+
+def bok_prior_select_and_cyc_dual(
+    model, device, K: int,
+    x_feat,                  # [B, H]
+    x_flat_std,              # [B, Xd_concat] Target
+    mu_prior, logvar_prior,  # [B, L]
+    y_tf, y_tf_proxy, 
+    proxy_iv, proxy_gm, L_iv: int, 
+    x_mu_c, x_std_c, x_mu_p, x_std_p,
+    y_idx_c_from_p,
+    cyc_crit,
+):
+    """
+    Best-of-K selection using Dual Proxies (IV + GM).
+    Returns: y_best32, cyc_sim_scalar, x_hat_std_sim_prior_best
+    """
+    B, L = mu_prior.shape
+    # 1. Expand and Sample
+    muK = mu_prior.unsqueeze(1).expand(B, K, L)
+    lvK = logvar_prior.unsqueeze(1).expand(B, K, L)
+    eps = torch.randn_like(muK)
+    zK  = muK + eps * torch.exp(0.5 * lvK)     # [B,K,L]
+    xK  = x_feat.unsqueeze(1).expand(B, K, x_feat.shape[-1]) # [B,K,H]
+
+    # 2. Decode K candidates
+    in_dec = torch.cat([xK.reshape(B*K, -1), zK.reshape(B*K, -1)], dim=1)
+    yK = model.decoder(in_dec)
+    yK32 = _sanitize(yK.to(torch.float32)) # [B*K, Dy]
+
+    # 3. Dual Proxy Inference on all K candidates
+    y_physK = _sanitize(y_tf.inverse(yK32))
+    if y_idx_c_from_p is not None:
+        y_physK = y_physK.index_select(1, y_idx_c_from_p)
+    y_proxy_normK = _sanitize(y_tf_proxy.transform(y_physK))
+
+    pred_iv_pK = _sanitize(proxy_iv(y_proxy_normK)) # [B*K, L_iv]
+    pred_gm_pK = _sanitize(proxy_gm(y_proxy_normK)) # [B*K, L_gm]
+
+    # 4. Domain Adaptation & Concat
+    mu_p_iv, mu_p_gm = x_mu_p[:L_iv], x_mu_p[L_iv:]
+    std_p_iv, std_p_gm = x_std_p[:L_iv], x_std_p[L_iv:]
+    mu_c_iv, mu_c_gm = x_mu_c[:L_iv], x_mu_c[L_iv:]
+    std_c_iv, std_c_gm = x_std_c[:L_iv], x_std_c[L_iv:]
+
+    # IV Path
+    pred_iv_physK = pred_iv_pK * std_p_iv + mu_p_iv
+    pred_iv_currK = _sanitize((pred_iv_physK - mu_c_iv) / std_c_iv)
+    
+    # GM Path
+    pred_gm_physK = pred_gm_pK * std_p_gm + mu_p_gm
+    pred_gm_currK = _sanitize((pred_gm_physK - mu_c_gm) / std_c_gm)
+
+    # Combined reconstruction [B*K, L_iv+L_gm]
+    xhat_curr_stdK = torch.cat([pred_iv_currK, pred_gm_currK], dim=1)
+
+    # 5. Calculate Selection Error (SmoothL1 per sample)
+    x_ref = _sanitize(x_flat_std.unsqueeze(1).expand(B, K, x_flat_std.shape[-1]).reshape(B*K, -1))
+    valid = torch.isfinite(xhat_curr_stdK).all(dim=1) & torch.isfinite(x_ref).all(dim=1)
+    diff = xhat_curr_stdK - x_ref
+    
+    # Calculate error across the WHOLE curve (IV + GM)
+    ps = _smooth_l1_per_sample(diff, beta=0.02)
+    ps = torch.where(valid, ps, torch.full_like(ps, 1e9))
+
+    # 6. Select Best
+    cyc_mat = ps.view(B, K)
+    best_idx = torch.argmin(cyc_mat, dim=1)
+    
+    # Gather best Y
+    Dy = yK32.shape[-1]
+    y_best32 = yK32.view(B, K, Dy).gather(1, best_idx.view(B,1,1).expand(-1,1,Dy)).squeeze(1)
+    
+    # Gather best reconstruction (for diag/logging)
+    Xd = xhat_curr_stdK.shape[-1]
+    x_hat_std_sim_prior_best = xhat_curr_stdK.view(B, K, Xd).gather(1, best_idx.view(B,1,1).expand(-1,1,Xd)).squeeze(1)
+
+    # 7. Recalculate Split Loss for the winner (to return scalar loss)
+    # We could reuse `ps` but that's combined. NormCalc_cyc_dual returns split losses, 
+    # but here we return a scalar total cyc_sim for backwards compat, or use NormCalc inside loop.
+    # To keep Training loop consistent, we let Training loop call NormCalc_cyc_dual on y_best32.
+    # But wait, the function signature usually returns (y_best, cyc_loss, x_recon).
+    
+    cyc_sim_scalar = ps.view(B,K).gather(1, best_idx.view(B,1)).mean()
+
+    return y_best32, cyc_sim_scalar, x_hat_std_sim_prior_best
+
+
+
+def calc_advanced_physics_loss(pred_flat, target_flat, shape, mode='iv', device='cuda'):
+    """
+    Advanced Physics Loss V3 (Corrected)
+    
+    Args:
+        pred_flat: [B, N_points_total]
+        target_flat: [B, N_points_total]
+        shape: Tuple, e.g. (7, 121) for IV, (10, 71) for GM
+        mode: 'iv' or 'gm'
+    """
+    B = pred_flat.size(0)
+    # 1. restone shape: [B, N_curves, N_points]
+    pred = pred_flat.view(B, *shape)
+    targ = target_flat.view(B, *shape)
+
+    total_loss = 0.0
+
+    if mode == 'iv':
+        # --- IV Constraint 1: Saturation Current (Max) ---
+        pred_max = pred.max(dim=2).values
+        targ_max = targ.max(dim=2).values
+        loss_max = F.l1_loss(pred_max, targ_max)
+        total_loss += 4.0 * loss_max
+
+        # --- IV Constraint 2: Leakage/Start Level (Min) ---
+        pred_min = pred.min(dim=2).values
+        targ_min = targ.min(dim=2).values
+        loss_min = F.l1_loss(pred_min, targ_min)
+        total_loss += 4.0 * loss_min
+
+        # --- IV Constraint 3: Linear Slope at Zero-Crossing (Index 36) ---
+        idx = 36
+        if idx < shape[1] - 1:
+            pred_slope = pred[:, :, idx+1] - pred[:, :, idx]
+            targ_slope = targ[:, :, idx+1] - targ[:, :, idx]
+            loss_slope = F.l1_loss(pred_slope, targ_slope)
+            total_loss += 10.0 * loss_slope
+
+        # --- IV Constraint 4: Power/Area (Integrate from Vds=0) ---
+        if idx < shape[1]:
+            pred_power = pred[:, :, idx:].sum(dim=2)
+            targ_power = targ[:, :, idx:].sum(dim=2)
+            loss_power = F.l1_loss(pred_power, targ_power)
+            total_loss += 0.01 * loss_power
+
+        # --- IV Constraint 5: Knee Sharpness / Smoothness (Max 2nd Derivative) ---
+        # 1st Derivative (Slope)
+        # Shape: [B, 7, 120]
+        diff1_pred = pred[:, :, 1:] - pred[:, :, :-1]
+        diff1_targ = targ[:, :, 1:] - targ[:, :, :-1]
+
+        diff2_pred = diff1_pred[:, :, :-1] - diff1_pred[:, :, 1:]
+        diff2_targ = diff1_targ[:, :, :-1] - diff1_targ[:, :, 1:]
+        
+        pred_knee = diff2_pred.max(dim=2).values # [B, 7]
+        targ_knee = diff2_targ.max(dim=2).values # [B, 7]
+
+        loss_smooth = F.l1_loss(pred_knee, targ_knee)
+        
+        total_loss += 2.0 * loss_smooth
+        # print(f'[TEST iv physical!!!]')
+        # print(f'>>> loss_max = {loss_max}')
+        # print(f'>>> loss_min = {loss_min}')
+        # print(f'>>> loss_slope = {loss_slope}')
+        # print(f'>>> loss_power = {loss_power}')
+        # print(f'>>> loss_smooth = {loss_smooth}')
+
+    elif mode == 'gm':
+        # --- GM Constraint 1: Peak Transconductance (Max) ---
+        pred_max = pred.max(dim=2).values
+        targ_max = targ.max(dim=2).values
+        loss_max = F.l1_loss(pred_max, targ_max)
+        total_loss += 4.0 * loss_max
+
+        # --- GM Constraint 2: Voff Position (Centroid) ---
+        grid = torch.arange(shape[1], device=device, dtype=torch.float32)
+        grid = grid.view(1, 1, -1).expand(B, shape[0], -1)
+        
+        # Use ReLU to focus on positive Gm region for centroid calc
+        pred_pos = F.relu(pred)
+        targ_pos = F.relu(targ)
+        
+        pred_sum = pred_pos.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        targ_sum = targ_pos.sum(dim=2, keepdim=True).clamp_min(1e-6)
+        
+        pred_prob = pred_pos / pred_sum
+        targ_prob = targ_pos / targ_sum
+
+        pred_centroid = (pred_prob * grid).sum(dim=2)
+        targ_centroid = (targ_prob * grid).sum(dim=2)
+        
+        loss_voff = F.mse_loss(pred_centroid, targ_centroid)
+        total_loss += 5e-4 * loss_voff
+        # print(f'[TEST gm physical!!!]')
+        # print(f'>>> loss_max = {loss_max}')
+        # print(f'>>> loss_voff = {loss_voff}')
+    else:
+        raise KeyError('Given mode is invalid in regulations.calc_advanced_physics_loss, neither iv nor gm!')
+
+    return total_loss
