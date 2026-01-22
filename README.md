@@ -17,6 +17,9 @@ A deep learning-based framework for automatic parameter extraction of GaN ASM-HE
   - [📂 Project Structure](#-project-structure)
   - [🛠 Installation](#-installation)
   - [🚀 Workflow \& Training](#-workflow--training)
+  - [📊 Version History \& Performance](#-version-history--performance)
+    - [Version History of only CNN + CVAE uni-directional Case](#version-history-of-only-cnn--cvae-uni-directional-case)
+    - [Performance](#performance)
   - [🛠 Future Work](#-future-work)
   - [⚖️ License](#️-license)
   - [👥 Contact](#-contact)
@@ -49,6 +52,16 @@ showed in figure:
 <img src="./img/work_flow_2channel.png" alt='ss' width=80%/>
 </p> 
 
+Schematic of the CNN in 1-stage for feature extractor:
+<p align = "center">    
+<img src="./img/CNN.svg" alt='ss' width=100%/>
+</p> 
+
+Schematic of CNN + CVAE architecture:
+<p align = "center">    
+<img src="./img/model_2Channel.svg" alt='ss' width=80%/>
+</p> 
+
 ---
 ## 📂 Project Structure
 
@@ -60,11 +73,6 @@ showed in figure:
 ├── data_viewer/           # GUI/Scripts for Model performance diagnostic tools
 └── README.md              # Project documentation
 ```
-Best Model location，navigate to path:
-1. CNN + CVAE based unidirectional GaN HEMTs : `NN_training\model\cvae_Unidi_14param_2channel\version_2_4`
-2. Baseline of unidirectional GaN HEMTs : `NN_training\model\Unidi_pureMLP_2channel_baseline`
-3. CNN + CVAE based bi-directional GaN HEMTs : `NN_training\model\cvae_Bidi_11param_2channel\version_1_3`
-4. Baseline of bidirectional GaN HEMTs : `NN_training\model\Bidi_pureMLP_2channel_baseline`
 
 ---
 ## 🛠 Installation
@@ -180,7 +188,273 @@ python code_file_path ^
   --steps 1000 --lr 0.05
 ```
 ---
+## 📊 Version History & Performance
 
+Best Model location，navigate to path:
+1. CNN + CVAE based unidirectional GaN HEMTs : `NN_training\model\cvae_Unidi_14param_2channel\version_2_4`
+2. Baseline of unidirectional GaN HEMTs : `NN_training\model\Unidi_pureMLP_2channel_baseline`
+3. CNN + CVAE based bi-directional GaN HEMTs : `NN_training\model\cvae_Bidi_11param_2channel\version_1_3`
+4. Baseline of bidirectional GaN HEMTs : `NN_training\model\Bidi_pureMLP_2channel_baseline`
+
+### Version History of only CNN + CVAE uni-directional Case
+**version 1.x : hybrid/cnn based**
+<font color=red> Conclusion: </font> dropout is necessary, physical stats are useless !
+<table>
+  <tr style="background-color: #f2f2f2;">
+    <th><strong>Parameter</strong></th>
+    <th><strong>version-1.1</strong></th>
+    <th><strong>version-1.2</strong></th>
+    <th><strong>version-1.3</strong></th>
+    <th><strong>version-1.4</strong></th>
+    <th><strong>version-1.5</strong></th>
+    <th><strong>version-1.6</strong></th>
+  </tr>
+  </tr>
+    <tr>
+    <td>Adjustment</td>
+    <td>default config, use_stats::OFF</td>
+    <td>default config, use_stats::ON </td>
+    <td>change 3*3 default cnn kern to (3,12) & (3,6), use_stats::OFF</td>
+    <td>same as version 1.3, dropout = 0</td>
+    <td>change 3*3 default cnn kern to (3,12) & (3,6), use_stats::ON</td>
+    <td>same as version 1.5, dropout = 0</td>
+  </tr>
+  </tr>
+    <tr>
+    <td>epoch</td>
+    <td>  52/300 </td>
+    <td>  58/300 </td>
+    <td>  102/300 </td>
+    <td>  44/300 </td>
+    <td>  87/300 </td>
+    <td>  47/300 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_sim_prior</td>
+    <td> 0.182 </td>
+    <td> 0.182 </td>
+    <td> 0.146 </td>
+    <td> 0.633 </td>
+    <td style="color: #ff0000;"> 0.132 </td>
+    <td> 0.523 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_meas</td>
+    <td> 0.261 </td>
+    <td> 0.203 </td>
+    <td style="color: #ff0000;"> 0.185 </td>
+    <td> 0.238 </td>
+    <td> 0.209 </td>
+    <td> 0.225 </td>  
+  </tr>
+</tr>
+    <tr>
+    <td>nMAE<br>N samplings based</td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+  </tr>
+</table>
+
+
+
+**version 2.x : MLP based encoder**
+<font color=red> Conclusion: </font> dropout + MLP + pysical states help for better performance
+<table>
+  <tr style="background-color: #f2f2f2;">
+    <th><strong>Parameter</strong></th>
+    <th><strong>version-2.1</strong></th>
+    <th><strong>version-2.2</strong></th>
+    <th><strong>version-2.3</strong></th>
+    <th><strong>version-2.4</strong></th>
+    <th><strong>version-2.5</strong></th>
+    <th><strong>version-2.6</strong></th>
+  </tr>
+  </tr>
+    <tr>
+    <td>Adjustment</td>
+    <td>defult config but MLP<br>default iv/gm wight of 1/1<br></td>
+    <td>iv/gm wight of 5/1<br>patience->80<br>bigger hidden layer 2048,1024,512 </td>
+    <td>iv/gm wight of 2/1<br>patience->80</td>
+    <td>iv/gm wight of 5/1<br>patience->80</td>
+    <td>iv/gm wight of 0.5/1<br>patience->80</td>
+    <td>iv/gm wight of 1/1<br>patience->80<br>dropout(both)->0.2</td>
+  </tr>
+  </tr>
+    <tr>
+    <td>epoch</td>
+    <td>  111/300 </td>
+    <td>  111/300 </td>
+    <td>  164/300 </td>
+    <td>  300/300 </td>
+    <td>  119/300 </td>
+    <td>  126/300 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_sim_prior</td>
+    <td> 1.272 </td>
+    <td> 2.874 </td>
+    <td> 2.476 </td>
+    <td> 2.293 </td>
+    <td> 1.563 </td>
+    <td> 0.918 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_meas</td>
+    <td> 0.0492 </td>
+    <td> 0.409 </td>
+    <td> 0.101 </td>
+    <td> 0.106 </td>
+    <td> 0.0291 </td>
+    <td> 0.0390 </td>  
+  </tr>
+</tr>
+    <tr>
+    <td>nMAE<br>N samplings based</td>
+    <td style="color: #ff0000;">best 2  </td>
+    <td>  </td>
+    <td>  </td>
+    <td style="color: #ff0000;">best 1   </td>
+    <td>  </td>
+    <td>  </td>
+  </tr>
+</table>
+
+**version 2.7 - version 2.10:**
+<strong><font color=red> FIX </font> :: print real cyc_loss without multiplied weight iv/gm, otherwise loss print will be polutted</strong>
+
+<table>
+  <tr style="background-color: #f2f2f2;">
+    <th><strong>Parameter</strong></th>
+    <th><strong>version-2.7</strong></th>
+    <th><strong>version-2.8</strong></th>
+    <th><strong>version-2.9</strong></th>
+    <th><strong>version-2.10</strong></th>
+  </tr>
+  </tr>
+    <tr>
+    <td>Adjustment</td>
+    <td>iv/gm wight of 5/1<br>patience->100<br>max epoch->500</td>
+    <td>iv/gm wight of 5/1<br>patience->80<br>dropout(both)->0.2</td>
+    <td>iv/gm wight of 7/1<br>patience->80</td>
+    <td>iv/gm wight of 10/1<br>patience->80</td>
+  </tr>
+  </tr>
+    <tr>
+    <td>epoch</td>
+    <td>  300/300 </td>
+    <td>  207/300 </td>
+    <td>  203/300 </td>
+    <td>  150/300 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_sim_prior</td>
+    <td> 0.838 </td>
+    <td> 0.782 </td>
+    <td> 0.823 </td>
+    <td> 1.077 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_meas</td>
+    <td> 0.0344 </td>
+    <td> 0.0441 </td>
+    <td> 0.0740 </td>
+    <td> 0.116 </td> 
+  </tr>
+</tr>
+    <tr>
+    <td>nMAE<br>N samplings based</td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+    <td>  </td>
+  </tr>
+</table>
+
+
+
+**version 2.11 - version 2.15:**
+<strong><font color=red> FIX </font> :: use bigger training dataset</strong>
+<font color=red> Conclusion: </font> seems like 1-stage training already reaches to the performance cell, the do 2-stage training in version 3
+<table>
+  <tr style="background-color: #f2f2f2;">
+    <th><strong>Parameter</strong></th>
+    <th><strong>version-2.11</strong></th>
+    <th><strong>version-2.12</strong></th>
+    <th><strong>version-2.13</strong></th>
+    <th><strong>version-2.14</strong></th>
+    <th><strong>version-2.15</strong></th>
+  </tr>
+  </tr>
+    <tr>
+    <td>Adjustment</td>
+    <td>iv/gm wight of 5/1<br>patience->100</td>
+    <td>new physical loss - only iv<br>iv/gm wight of 5/1<br>patience->100<br>lambda_phys_sim/lambda_phys_meas=2/1(only iv)</td>
+    <td>new physical loss - iv/gm<br>iv/gm wight of 5/1<br>patience->100<br>lambda_phys_sim/lambda_phys_meas=2/1(only iv)</td>
+    <td>iv/gm wight of 5/1<br>patience->100<br>reduced weight of physical feature->avoid broken<br>lr=1.7e-4</td>
+    <td>iv/gm wight of 5/1<br>patience->100<br>reduced weight of physical feature->avoid broken<br>lr=1.9e-4</td>
+  </tr>
+  </tr>
+    <tr>
+    <td>epoch</td>
+    <td>  233/300 </td>
+    <td>  193/300 </td>
+    <td>  300/300 </td>
+    <td>  188/300 </td>
+    <td>  139/300 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_sim_prior</td>
+    <td> 0.674 </td>
+    <td> 0.551 </td>
+    <td> 0.522 </td>
+    <td> 0.662 </td>
+    <td style="color: #ff0000;"> 0.324 </td>
+  </tr>
+  </tr>
+    <tr>
+    <td>cyc_meas</td>
+    <td> 0.0230 </td>
+    <td style="color: #ff0000;"> 0.0218 </td>
+    <td> 0.0691 </td>
+    <td> 0.0299 </td> 
+    <td> 0.0253 </td> 
+  </tr>
+</tr>
+    <tr>
+    <td>nMAE<br>N samplings based</td>
+    <td>  </td>
+    <td>15.1%/7.9%</td>
+    <td style="color: #ff0000;"> 12.3%/5.2% </td>
+    <td></td>
+  </tr>
+</table>
+
+*weired infer result in **version 2.15**: stange large knee during inference: not really limited by physical feature but gernerally not bad*
+
+### Performance
+
+Regression result of uni-directional GaN HEMTs:
+<p align = "center">    
+<img src="./img/unidi_result_compare.svg" alt='ss' width=80%/>
+</p> 
+
+Regression result of bi-directional GaN HEMTs:
+<p align = "center">    
+<img src="./img/bidi_result_compare.svg" alt='ss' width=80%/>
+</p> 
+
+---
 ## 🛠 Future Work
 
 1. 14 -> 15 ASM-HEMT, take self-heating effect also into consideration
